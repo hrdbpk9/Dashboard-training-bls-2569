@@ -612,8 +612,12 @@ function escapeHtml(str) {
 // -----------------------------------------------------------
 // Excel Export — 2 ชีท: เข้าอบรมแล้ว | ยังไม่เข้าอบรม
 // -----------------------------------------------------------
-function downloadExcel() {
-  if (!lastRegisteredRows.length && !DEPT_HEADCOUNT) return;
+// ID ของ Google Sheet ที่เก็บข้อมูลการลงทะเบียน (Google Form)
+const FORM_SHEET_ID = '1Bzx9rTcqcIvOO9bBDJCy3rtda0fANwv1088cBxI-YbU';
+const FORM_CSV_URL = `https://docs.google.com/spreadsheets/d/${FORM_SHEET_ID}/gviz/tq?tqx=out:csv`;
+
+async function downloadExcel() {
+  if (!lastRegisteredRows.length && !EMPLOYEES) return;
 
   const btn = el('btnDownloadExcel');
   const originalHtml = btn.innerHTML;
@@ -621,63 +625,105 @@ function downloadExcel() {
   btn.innerHTML = `<span style="width:12px;height:12px;border-radius:50%;border:2px solid rgba(255,255,255,0.4);border-top-color:#fff;animation:spin .7s linear infinite;display:inline-block;"></span> กำลังสร้างไฟล์...`;
 
   try {
-    const wb = XLSX.utils.book_new();
+    // ===== ดึงข้อมูลชีทลงทะเบียน (Google Form) =====
+    let formRegistrations = {}; // empId -> รอบที่ลงทะเบียน
+    try {
+      const sep = FORM_CSV_URL.includes('?') ? '&' : '?';
+      const res = await fetch(FORM_CSV_URL + sep + '_=' + Date.now(), { cache: 'no-store' });
+      if (res.ok) {
+        const text = await res.text();
+        const rows = parseGvizCsv(text);
+        if (rows.length > 1) {
+          const header = rows[0].map(h => h.trim());
+          const idxId = header.findIndex(h => h.includes('รหัสพนักงาน'));
+          const idxSession = header.findIndex(h => h.includes('วันและเวลา') || h.includes('เข้าอบรม'));
+          rows.slice(1).forEach(row => {
+            const empId = String(row[idxId] || '').trim().toUpperCase();
+            const session = String(row[idxSession] || '').trim();
+            if (empId && session && !formRegistrations[empId]) {
+              formRegistrations[empId] = session;
+            }
+          });
+        }
+      }
+    } catch (e) {
+      console.warn('[BLS Dashboard] โหลดชีทลงทะเบียน (Form) ไม่สำเร็จ:', e);
+    }
 
-    // ===== ชีท 1: รายชื่อที่เข้าอบรมแล้ว =====
-    const attendedHeader = ['ลำดับ', 'รหัสพนักงาน', 'คำนำหน้า', 'ชื่อ', 'สกุล', 'ตำแหน่ง', 'แผนก', 'รหัสรอบ', 'วันที่อบรม', 'เวลาอบรม', 'วันเวลาที่ลงทะเบียน'];
-    const attendedData = lastRegisteredRows.map((row, i) => [
-      i + 1,
-      row[1] || '',   // รหัสพนักงาน
-      row[2] || '',   // คำนำหน้า
-      row[3] || '',   // ชื่อ
-      row[4] || '',   // สกุล
-      row[5] || '',   // ตำแหน่ง
-      row[6] || '',   // แผนก
-      row[7] || '',   // รหัสรอบ
-      row[8] || '',   // วันที่อบรม
-      row[9] || '',   // เวลาอบรม
-      row[0] || '',   // Timestamp
-    ]);
-    const ws1 = XLSX.utils.aoa_to_sheet([attendedHeader, ...attendedData]);
-    styleSheet(ws1, attendedHeader.length, attendedData.length);
-    XLSX.utils.book_append_sheet(wb, ws1, 'เข้าอบรมแล้ว');
-
-    // ===== ชีท 2: รายชื่อที่ยังไม่เข้าอบรม =====
-    // รวบรวมรหัสพนักงานที่ลงทะเบียนแล้ว (case-insensitive)
-    const registeredIds = new Set(lastRegisteredRows.map(r => String(r[1] || '').trim().toUpperCase()));
-
-    const notAttendedHeader = ['ลำดับ', 'รหัสพนักงาน', 'คำนำหน้า', 'ชื่อ', 'สกุล', 'ตำแหน่ง', 'แผนก'];
-    const notAttendedData = [];
-    let seq = 1;
-    Object.entries(EMPLOYEES).forEach(([empId, info]) => {
-      if (!registeredIds.has(empId.toUpperCase())) {
-        const [title, firstName, lastName, position, dept] = info;
-        notAttendedData.push([seq++, empId, title, firstName, lastName, position, dept]);
+    // ===== รวบรวมข้อมูลเข้าอบรมจริง (Registrations sheet) =====
+    const attended = {}; // empId -> รอบที่เข้าจริง
+    lastRegisteredRows.forEach(row => {
+      const empId = String(row[1] || '').trim().toUpperCase();
+      if (empId && !attended[empId]) {
+        attended[empId] = (row[8] + ' ' + row[9]).trim();
       }
     });
-    // เรียงตามแผนก แล้วตามนามสกุล
-    notAttendedData.sort((a, b) => {
-      const deptCmp = String(a[6]).localeCompare(String(b[6]), 'th');
-      if (deptCmp !== 0) return deptCmp;
+
+    // ===== สร้างชีทรวม: พนักงานทุกคน 1,003 คน =====
+    const masterHeader = [
+      'ลำดับ', 'รหัสพนักงาน', 'คำนำหน้า', 'ชื่อ', 'สกุล', 'ตำแหน่ง', 'แผนก/หน่วยงาน',
+      'รอบที่ลงทะเบียน', 'รอบที่เข้าอบรมจริง', 'สถานะ'
+    ];
+
+    const masterData = [];
+    Object.entries(EMPLOYEES).forEach(([empId, info]) => {
+      const [title, firstName, lastName, position, dept] = info;
+      const regSession = formRegistrations[empId.toUpperCase()] || '';
+      const attSession = attended[empId.toUpperCase()] || '';
+      let status = 'ยังไม่ลงทะเบียน';
+      if (attSession) status = 'เข้าอบรมแล้ว';
+      else if (regSession) status = 'ลงทะเบียนแล้ว (ยังไม่เข้าอบรม)';
+      masterData.push([0, empId, title, firstName, lastName, position, dept, regSession, attSession, status]);
+    });
+
+    // เรียงตามสถานะ → แผนก → นามสกุล
+    const statusOrder = { 'เข้าอบรมแล้ว': 0, 'ลงทะเบียนแล้ว (ยังไม่เข้าอบรม)': 1, 'ยังไม่ลงทะเบียน': 2 };
+    masterData.sort((a, b) => {
+      const sCmp = (statusOrder[a[9]] ?? 9) - (statusOrder[b[9]] ?? 9);
+      if (sCmp !== 0) return sCmp;
+      const dCmp = String(a[6]).localeCompare(String(b[6]), 'th');
+      if (dCmp !== 0) return dCmp;
       return String(a[4]).localeCompare(String(b[4]), 'th');
     });
-    notAttendedData.forEach((row, i) => row[0] = i + 1); // re-number after sort
+    masterData.forEach((row, i) => row[0] = i + 1);
 
-    const ws2 = XLSX.utils.aoa_to_sheet([notAttendedHeader, ...notAttendedData]);
-    styleSheet(ws2, notAttendedHeader.length, notAttendedData.length);
-    XLSX.utils.book_append_sheet(wb, ws2, 'ยังไม่เข้าอบรม');
+    const colWidths = [{wch:6},{wch:14},{wch:10},{wch:18},{wch:18},{wch:28},{wch:28},{wch:38},{wch:34},{wch:32}];
+    const wb = XLSX.utils.book_new();
 
-    // ===== ชีท 3: สรุปรายแผนก =====
-    const deptSummaryHeader = ['แผนก/หน่วยงาน', 'พนักงานทั้งหมด', 'เข้าอบรมแล้ว', 'คงเหลือ', '% เข้าอบรม'];
-    const deptSummaryData = deptRows
+    // ชีท 1: รายชื่อทั้งหมด
+    const wsMaster = XLSX.utils.aoa_to_sheet([masterHeader, ...masterData]);
+    wsMaster['!cols'] = colWidths;
+    wsMaster['!freeze'] = {xSplit:0, ySplit:1};
+    XLSX.utils.book_append_sheet(wb, wsMaster, 'รายชื่อทั้งหมด');
+
+    // ชีท 2: เข้าอบรมแล้ว
+    const attendedOnly = masterData.filter(r => r[9] === 'เข้าอบรมแล้ว');
+    const wsAttended = XLSX.utils.aoa_to_sheet([masterHeader, ...attendedOnly]);
+    wsAttended['!cols'] = colWidths;
+    wsAttended['!freeze'] = {xSplit:0, ySplit:1};
+    XLSX.utils.book_append_sheet(wb, wsAttended, 'เข้าอบรมแล้ว');
+
+    // ชีท 3: ยังไม่เข้าอบรม (รวมลงทะเบียนแล้วแต่ยังไม่ได้เข้า)
+    const notYet = masterData.filter(r => r[9] !== 'เข้าอบรมแล้ว');
+    const wsNotYet = XLSX.utils.aoa_to_sheet([masterHeader, ...notYet]);
+    wsNotYet['!cols'] = colWidths;
+    wsNotYet['!freeze'] = {xSplit:0, ySplit:1};
+    XLSX.utils.book_append_sheet(wb, wsNotYet, 'ยังไม่เข้าอบรม');
+
+    // ชีท 4: สรุปรายแผนก
+    const deptHeader = ['แผนก/หน่วยงาน', 'พนักงานทั้งหมด', 'ลงทะเบียนแล้ว', 'เข้าอบรมแล้ว', 'คงเหลือ', '% เข้าอบรม'];
+    const deptData = deptRows.slice()
       .sort((a, b) => b.pct - a.pct || b.registered - a.registered)
-      .map(r => [r.name, r.total, r.registered, r.remaining, parseFloat(r.pct.toFixed(1))]);
-    const ws3 = XLSX.utils.aoa_to_sheet([deptSummaryHeader, ...deptSummaryData]);
-    styleSheet(ws3, deptSummaryHeader.length, deptSummaryData.length);
-    XLSX.utils.book_append_sheet(wb, ws3, 'สรุปรายแผนก');
+      .map(r => {
+        const regCnt = masterData.filter(row => row[6] === r.name && row[9] !== 'ยังไม่ลงทะเบียน').length;
+        return [r.name, r.total, regCnt, r.registered, r.remaining, parseFloat(r.pct.toFixed(1))];
+      });
+    const wsDept = XLSX.utils.aoa_to_sheet([deptHeader, ...deptData]);
+    wsDept['!cols'] = [{wch:32},{wch:16},{wch:16},{wch:16},{wch:12},{wch:14}];
+    wsDept['!freeze'] = {xSplit:0, ySplit:1};
+    XLSX.utils.book_append_sheet(wb, wsDept, 'สรุปรายแผนก');
 
-    // ===== Export =====
-    const dateStr = new Date().toLocaleDateString('th-TH', {year: 'numeric', month: '2-digit', day: '2-digit'}).replace(/\//g, '-');
+    const dateStr = new Date().toLocaleDateString('th-TH', {year:'numeric', month:'2-digit', day:'2-digit'}).replace(/\//g, '-');
     XLSX.writeFile(wb, `สรุปผลอบรม_BLS2569_${dateStr}.xlsx`);
 
   } catch (err) {
@@ -688,6 +734,7 @@ function downloadExcel() {
     btn.innerHTML = originalHtml;
   }
 }
+
 
 function styleSheet(ws, numCols, numRows) {
   // ตั้งความกว้างคอลัมน์อัตโนมัติ (กว้างขึ้นสำหรับคอลัมน์ข้อความ)
